@@ -150,7 +150,21 @@ class QwenPawDataHintMiddleware(MiddlewareBase):
     async def on_system_prompt(self, agent: "Agent", current_prompt: str) -> str:
         hint = self._rs.get_current_hint()
         if hint:
-            return current_prompt + "\n\n" + hint
+            current_prompt = current_prompt + "\n\n" + hint
+        try:
+            gid = getattr(self._rs, "current_graph_id", None)
+            nodes = getattr(self._rs, "_graph_nodes")() if gid else []
+            if gid and nodes and all(
+                str(getattr(n, "state", "")) in ("done", "failed", "abandoned")
+                for n in nodes
+            ):
+                current_prompt += (
+                    "\n\n<finish-required>当前 TaskGraph 所有节点已结束，但尚未调用 "
+                    "finish_plan。最终答复前必须先调用 finish_plan(state=\"done\", "
+                    "outcome=...)，否则视为未完成；不要直接输出最终报告。</finish-required>"
+                )
+        except Exception:  # noqa: BLE001
+            pass
         return current_prompt
 
 
@@ -288,10 +302,33 @@ class QwenPawDataTraceMiddleware(MiddlewareBase):
         self._record_terminal_trace(payload, phase=phase, context=context)
         await self._append_session_trace(payload, phase=phase, context=context)
 
+    def _record_skill_read(self, tool_name: str, tool_input: Any) -> None:
+        """从工具调用直接记录技能读取，绕开 trace 的 active-graph 限制。"""
+        try:
+            from . import skill_router
+
+            payload = tool_input
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {"raw": payload}
+            names = skill_router.skills_from_traces(payload)
+            if tool_name == "Skill" and isinstance(payload, dict):
+                name = payload.get("skill")
+                if name and str(name) not in names:
+                    names.append(str(name))
+            for name in names:
+                if name and name != "*" and name not in self._rs._skill_reads:
+                    self._rs._skill_reads.append(name)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _append_tool_call_trace(self, tool_call: Any) -> None:
         tool_call_id = str(getattr(tool_call, "id", "") or "")
         tool_name = str(getattr(tool_call, "name", "") or "")
         tool_input = getattr(tool_call, "input", "")
+        self._record_skill_read(tool_name, tool_input)
         for payload in (
             {
                 "type": "ToolCallExecutionStartEvent",
