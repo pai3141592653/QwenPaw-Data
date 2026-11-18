@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """RuntimeStateManager —— QwenPaw Data 运行时状态管理器。
 
 操作自持的 ``_nodes: List[TaskNode]`` 扁平列表，
@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -220,14 +221,13 @@ class RuntimeStateManager:
     ) -> None:
         self._nodes: List[TaskNode] = []
         self._current_graph_id: str | None = None
-        # Reply-local fallback after finish_plan clears the active graph.
-        # Intentionally excluded from persisted session state.
-        self.last_finished_graph_id: str | None = None
         self._trigger_msg_id: str = ""
         self.artifacts: List[ArtifactItem] = []
         self._pending_edits: list[dict] = []
         self._traces: Dict[str, list] = {}
         self._graph_registry: GraphRegistry = {}
+        # 独立于 active TaskGraph 的技能读取记录（create_plan 之前读的也算）。
+        self._skill_reads: list[str] = []
         self._artifact_path_context = artifact_path_context
         self._graph_to_hint = graph_to_hint or DefaultGraphToHint()
 
@@ -363,13 +363,23 @@ class RuntimeStateManager:
     # ==================================================================
 
     def append_to_trace(self, msg: Any) -> None:
-        """追加消息到当前执行节点的 trace。"""
+        """追加消息到当前执行节点的 trace；同时独立记录技能读取。"""
+        payload = None
+        try:
+            payload = _trace_payload(msg)
+            from . import skill_router
+
+            for _name in skill_router.skills_from_traces(payload):
+                if _name not in self._skill_reads:
+                    self._skill_reads.append(_name)
+        except Exception:  # noqa: BLE001 - 技能记录失败不影响 trace
+            pass
         if not self._current_graph_id:
             return
         gn = self._graph_nodes()
         for n in gn:
             if n.state == "in_progress":
-                trace_entry = _trace_payload(msg)
+                trace_entry = payload if payload is not None else _trace_payload(msg)
                 self._traces.setdefault(n.id, []).append(trace_entry)
                 return
 
@@ -488,12 +498,24 @@ class RuntimeStateManager:
         if not files:
             return []
         if isinstance(files, str):
-            try:
-                files = json.loads(files)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    "files must be a JSON array/object when provided as a string.",
-                ) from exc
+            raw = files.strip()
+            parsed = None
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    parsed = loader(raw)
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if parsed is None:
+                # 模型常把 Windows 路径直接塞进字符串（C:\Users\...），
+                # 其中的 \U / \s 不是合法 JSON 转义；把反斜杠转义后再试一次。
+                try:
+                    parsed = json.loads(raw.replace("\\", "\\\\"))
+                except Exception as exc:  # noqa: BLE001
+                    raise ValueError(
+                        "files must be a JSON array/object when provided as a string.",
+                    ) from exc
+            files = parsed
         if isinstance(files, dict):
             files = [files]
         if not isinstance(files, list):
@@ -726,7 +748,6 @@ class RuntimeStateManager:
                 n.state = state
 
         await self._notify_graph_change(TaskEventType.GRAPH_FINISHED)
-        self.last_finished_graph_id = self._current_graph_id
         self._current_graph_id = None
         return _text("Task graph finished.")
 
@@ -781,3 +802,4 @@ class RuntimeStateManager:
     def restore_state(self, state: Dict[str, Any]) -> None:
         """兼容旧接口。"""
         self.load_state_dict(state, strict=False)
+
