@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Literal
@@ -44,10 +45,15 @@ class QwenPawDataHost:
         home: str | Path | None = None,
         model: Any = None,
         workspace: Any = None,
-        workspace_type: Literal["local", "docker"] = "docker",
+        workspace_type: Literal["local", "docker"] = (
+            os.getenv("QWENPAW_DATA_WORKSPACE", "docker").strip().lower()
+            or "docker"
+        ),
         session_id: str | None = None,
         request_context: dict[str, Any] | None = None,
-        permission_mode: PermissionMode | str | None = None,
+        permission_mode: PermissionMode | str | None = (
+            os.getenv("QWENPAW_DATA_PERMISSION_MODE") or None
+        ),
         confirmation_handler: ConfirmationHandler | None = None,
         extra_middlewares: list[Any] | None = None,
         model_factory: Any = None,
